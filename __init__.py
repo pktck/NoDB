@@ -27,6 +27,9 @@ class RowAlreadyExists(Exception):
 class RowDoesNotExist(Exception):
     pass
 
+class WriteOnReadOnlyRow(Exception):
+    pass
+
 
 class LockBase(object):
     def __init__(self, fd):
@@ -61,6 +64,9 @@ class NoDBBase(object):
 
     def releaseLock(self):
         LockBase(self._fd_lock).releaseLock()
+
+    def __del__(self):
+        self.releaseLock()
 
 
 class Manager(object):
@@ -125,15 +131,28 @@ class Table(NoDBBase):
         self._fd_lock = open(os.path.join(self._data_dir, self._db, self._table, '.lock'), 'w')
 
     def get(self, key):
+        """Returns a Row. In a multi-process / multi-threaded application, getReadOnly(key) and
+        getLocked(key) should be used to prevent race conditions."""
         return Row(self._data_dir, self._db, self._table, key)
 
-    def getWithLock(self, key):
-        # user must manually release lock by calling releaseLock() on the row
-        return Row(self._data_dir, self._db, self._table, key, is_locked=True)
+    def getReadOnly(self, key):
+        """Returns a ReadOnlyRow (with no locks). A ReadOnlyRow behaves like a Row except
+        that it is not writable."""
+        return ReadOnlyRow(self._data_dir, self._db, self._table, key)
+
+    def getLocked(self, key):
+        """Returns a LockedRow. The lock is released when the object is deleted, or all references
+        to it are released."""
+        return LockedRow(self._data_dir, self._db, self._table, key)
 
     def create(self, key):
         with self.getExclusiveLock():
             row = Row(self._data_dir, self._db, self._table, key, is_new=True)
+        return row
+
+    def createLocked(self, key):
+        with self.getExclusiveLock():
+            row = LockedRow(self._data_dir, self._db, self._table, key, is_new=True)
         return row
 
     def remove(self, key):
@@ -146,8 +165,8 @@ class Table(NoDBBase):
                 raise
 
 
-class Row(NoDBBase):
-    def __init__(self, data_dir, db, table, key, is_new=False, is_locked=False):
+class RowBase(NoDBBase):
+    def __init__(self, data_dir, db, table, key, is_new=False):
         self._data_dir = data_dir
         self._db = db
         self._table = table
@@ -157,7 +176,8 @@ class Row(NoDBBase):
         if is_new: # note: must be run inside a table lock
             if os.path.exists(self._filename):
                 raise RowAlreadyExists
-            open(self._filename, 'w').close() # touch the file so we can lock it later
+            with open(self._filename, 'w') as fd:
+                fd.write('{}') # touch the file so we can lock it later, and fill it with an empty JSON dict
 
         try:
             self._fd_readonly = self._fd_lock = open(self._filename, 'r')
@@ -167,35 +187,21 @@ class Row(NoDBBase):
             else:
                 raise
 
+        if self._is_locked:
+            self.getExclusiveLock().acquireLock()
+
         if not is_new:
-            if is_locked:
-                self.getExclusiveLock().acquireLock()
             self._loadContents()
 
     def _loadContents(self):
         self._fd_readonly.seek(0)
-        with self.getSharedLock():
+        if not self._is_locked:
+            with self.getSharedLock():
+                contents = self._fd_readonly.read()
+        else:
             contents = self._fd_readonly.read()
         contents = self._desearialize(contents)
         self.__dict__.update(contents)
-
-    def _serializeHelper(self, d):
-        if type(d) in (list, tuple):
-            return map(self._serializeHelper, d)
-        elif type(d) == dict:
-            for key in d:
-                d[key] = self._serializeHelper(d[key])
-            return d
-        elif type(d) == datetime.datetime:
-            return {
-                    '_NoDBSpecialType': 'datetime',
-                    'value': d.ctime()}
-        elif type(d) in (dict, list, tuple, str, unicode, int, long, float, bool, types.NoneType): # json-supported data types
-            return d
-        else:
-            return {
-                    '_NoDBSpecialType': 'pickled_object',
-                    'value': pickle.dumps(d)}
 
     def __repr__(self):
         attribs = self._getPublicAttribs()
@@ -203,12 +209,6 @@ class Row(NoDBBase):
 
     def _getPublicAttribs(self):
         return dict([(key, value) for key, value in self.__dict__.items() if key[0] != '_'])
-
-    def _serialize(self):
-        attribs = self._getPublicAttribs()
-        attribs = self._serializeHelper(attribs)
-        attribs = json.dumps(attribs)
-        return attribs
 
     def _desearializeHelper(self, d):
         if type(d) in (list, tuple):
@@ -231,15 +231,55 @@ class Row(NoDBBase):
         contents = self._desearializeHelper(contents)
         return contents
 
-    def getSharedLock(self):
-        return SharedLock(self._fd_readonly)
 
-    def getExclusiveLock(self):
-        return ExclusiveLock(self._fd_readonly)
-
+class WritableRowBase(RowBase):
     def save(self):
         attribs = self._serialize()
         with self.getExclusiveLock():
             with open(self._filename, 'w') as fd:
                 fd.write(attribs)
+
+    def _serializeHelper(self, d):
+        if type(d) in (list, tuple):
+            return map(self._serializeHelper, d)
+        elif type(d) == dict:
+            for key in d:
+                d[key] = self._serializeHelper(d[key])
+            return d
+        elif type(d) == datetime.datetime:
+            return {
+                    '_NoDBSpecialType': 'datetime',
+                    'value': d.ctime()}
+        elif type(d) in (dict, list, tuple, str, unicode, int, long, float, bool, types.NoneType): # json-supported data types
+            return d
+        else:
+            return {
+                    '_NoDBSpecialType': 'pickled_object',
+                    'value': pickle.dumps(d)}
+
+    def _serialize(self):
+        attribs = self._getPublicAttribs()
+        attribs = self._serializeHelper(attribs)
+        attribs = json.dumps(attribs)
+        return attribs
+
+
+class Row(WritableRowBase):
+    def __init__(self, *args, **kwargs): 
+        self._is_locked = False
+        super(Row, self).__init__(*args, **kwargs)
  
+
+class ReadOnlyRow(RowBase):
+    def __init__(self, *args, **kwargs): 
+        self._is_locked = False
+        super(ReadOnlyRow, self).__init__(*args, **kwargs)
+
+
+class LockedRow(WritableRowBase):
+    def __init__(self, *args, **kwargs): 
+        self._is_locked = True
+        super(LockedRow, self).__init__(*args, **kwargs)
+
+
+
