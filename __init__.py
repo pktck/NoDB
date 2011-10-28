@@ -2,28 +2,7 @@ import os
 import shutil
 import errno
 from helper_classes import *
-
-class DatabaseAlreadyExists(Exception):
-    pass
-
-class DatabaseDoesNotExist(Exception):
-    pass
-
-class TableAlreadyExists(Exception):
-    pass
-
-class TableDoesNotExist(Exception):
-    pass
-
-class RowAlreadyExists(Exception):
-    pass
-
-class RowDoesNotExist(Exception):
-    pass
-
-class WriteOnReadOnlyRow(Exception):
-    pass
-
+from errors import *
 
 class Manager(object):
     def __init__(self, data_dir):

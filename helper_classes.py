@@ -6,6 +6,7 @@ import errno
 import shutil
 import types
 import pprint
+from errors import *
 try: # import the fastest json library available
     import ujson as json
 except ImportError:
@@ -190,6 +191,15 @@ class RowBase(NoDBBase):
         contents = json.loads(contents)
         contents = self._desearializeHelper(contents)
         return contents
+
+    def getCreated(self):
+        return datetime.datetime.fromtimestamp(os.path.getctime(self._filename))
+
+    def getModified(self):
+        return datetime.datetime.fromtimestamp(os.path.getmtime(self._filename))
+
+    def getKey(self):
+        return self._key
 
 
 class WritableRowBase(RowBase):
