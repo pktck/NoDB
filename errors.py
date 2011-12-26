@@ -18,5 +18,3 @@ class RowDoesNotExist(Exception):
 
 class WriteOnReadOnlyRow(Exception):
     pass
-
-

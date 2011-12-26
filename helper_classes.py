@@ -6,16 +6,33 @@ import errno
 import shutil
 import types
 import pprint
-from errors import *
-try: # import the fastest json library available
-    import ujson as json
-except ImportError:
-    import cjson
-    class json(object):
-        loads = cjson.decode
-        dumps = cjson.encode
-except ImportError:
-    import json
+import errors
+import random
+import string
+
+def getFastestJSONModule():
+    try:
+        module = __import__('ujson')
+        return module
+    except ImportError:
+        pass
+
+    try:
+        module = __import__('cjson')
+        class json(object):
+            loads = module.decode
+            dumps = module.encode
+        return json()
+    except ImportError:
+        pass
+
+    try:
+        module = __import__('json')
+        return module
+    except ImportError:
+        raise ImportError('No acceptable json module found.')
+
+json = getFastestJSONModule()
 
 
 class LockBase(object):
@@ -70,7 +87,7 @@ class Database(NoDBBase):
             os.mkdir(os.path.join(self._data_dir, self._db, table))
         except OSError as e:
             if e.errno == errno.EEXIST:
-                raise TableAlreadyExists
+                raise errors.TableAlreadyExists(table)
             else:
                 raise
 
@@ -79,7 +96,7 @@ class Database(NoDBBase):
             shutil.rmtree(os.path.join(self._data_dir, self._db, table))
         except OSError:
             if e.errno == errno.ENOENT: # if the table doesn't exist
-                raise TableDoesNotExist
+                raise errors.TableDoesNotExist(table)
             else:
                 raise
 
@@ -111,9 +128,31 @@ class Table(NoDBBase):
             row = Row(self._data_dir, self._db, self._table, key, is_new=True)
         return row
 
+    def createWithUniqueKey(self, key_len=5):
+        while True:
+            try:
+                key = self._generateRandomString(key_len)
+                row = self.create(key)
+                break
+            except RowAlreadyExists:
+                continue
+
+        return row
+
     def createLocked(self, key):
         with self.getExclusiveLock():
             row = LockedRow(self._data_dir, self._db, self._table, key, is_new=True)
+        return row
+
+    def createLockedWithUniqueKey(self, key_len=5):
+        while True:
+            try:
+                key = self._generateRandomString(key_len)
+                row = self.createLocked(key)
+                break
+            except errors.RowAlreadyExists:
+                continue
+
         return row
 
     def remove(self, key):
@@ -121,10 +160,12 @@ class Table(NoDBBase):
             os.remove(os.path.join(self._data_dir, self._db, self._table, key))
         except IOError as e:
             if e.errno == errno.ENOENT: # if the file doesn't exist
-                raise RowDoesNotExist
+                raise errors.RowDoesNotExist(key)
             else:
                 raise
 
+    def _generateRandomString(self, length=5):
+        return ''.join([random.choice(string.ascii_letters + string.digits) for i in range(length)])
 
 class RowBase(NoDBBase):
     def __init__(self, data_dir, db, table, key, is_new=False):
@@ -136,7 +177,7 @@ class RowBase(NoDBBase):
 
         if is_new: # note: must be run inside a table lock
             if os.path.exists(self._filename):
-                raise RowAlreadyExists
+                raise errors.RowAlreadyExists(key)
             with open(self._filename, 'w') as fd:
                 fd.write('{}') # touch the file so we can lock it later, and fill it with an empty JSON dict
 
@@ -144,7 +185,7 @@ class RowBase(NoDBBase):
             self._fd_readonly = self._fd_lock = open(self._filename, 'r')
         except IOError as e:
             if e.errno == errno.ENOENT: # if the file doesn't exist
-                raise RowDoesNotExist
+                raise errors.RowDoesNotExist(key)
             else:
                 raise
 

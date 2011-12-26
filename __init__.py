@@ -1,8 +1,8 @@
 import os
 import shutil
 import errno
-from helper_classes import *
-from errors import *
+from helper_classes import Database
+import errors
 
 class Manager(object):
     def __init__(self, data_dir):
@@ -16,7 +16,7 @@ class Manager(object):
             os.mkdir(os.path.join(self._data_dir, db))
         except OSError as e:
             if e.errno == errno.EEXIST:
-                raise DatabaseAlreadyExists
+                raise errors.DatabaseAlreadyExists(db)
             else:
                 raise
 
@@ -25,7 +25,7 @@ class Manager(object):
             shutil.rmtree(os.path.join(self._data_dir, db))
         except OSError:
             if e.errno == errno.ENOENT: # if the table doesn't exist
-                raise DatabaseDoesNotExist
+                raise errors.DatabaseDoesNotExist(db)
             else:
                 raise
 
