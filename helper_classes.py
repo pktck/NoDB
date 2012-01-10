@@ -34,43 +34,56 @@ def getFastestJSONModule():
 
 json = getFastestJSONModule()
 
-
-class LockBase(object):
+class Lock(object):
     def __init__(self, fd):
-        self._fd = fd
+        self.fd = fd
+        self.state = '' # can be 'shared', 'exclusive', 'saving', or '' (no lock)
+
+    def acquireSharedLock(self):
+        fcntl.flock(self.fd, fcntl.LOCK_SH)
+        self.state = 'shared'
+
+    def acquireExclusiveLock(self):
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        self.state = 'exclusive'
 
     def releaseLock(self):
-        fcntl.flock(self._fd, fcntl.LOCK_UN)
+        self.state = ''
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+
+    def getExclusiveLockWrapper(self):
+        return ExclusiveLockWrapper(self)
+
+    def getSharedLockWrapper(self):
+        return SharedLockWrapper(self)
+
+
+class ExclusiveLockWrapper(object):
+    def __init__(self, lock):
+        self.lock = lock
 
     def __enter__(self):
-        self.acquireLock()
+        self.lock.acquireExclusiveLock()
 
     def __exit__(self, type, value, traceback):
-        self.releaseLock()
+        self.lock.releaseLock()
 
 
-class SharedLock(LockBase):
-    def acquireLock(self):
-        fcntl.flock(self._fd, fcntl.LOCK_SH)
+class SharedLockWrapper(object):
+    def __init__(self, lock):
+        self.lock = lock
 
+    def __enter__(self):
+        self.lock.acquireSharedLock()
 
-class ExclusiveLock(LockBase):
-    def acquireLock(self):
-        fcntl.flock(self._fd, fcntl.LOCK_EX)
+    def __exit__(self, type, value, traceback):
+        self.lock.releaseLock()
 
 
 class NoDBBase(object):
-    def getSharedLock(self):
-        return SharedLock(self._fd_lock)
-
-    def getExclusiveLock(self):
-        return ExclusiveLock(self._fd_lock)
-
-    def releaseLock(self):
-        LockBase(self._fd_lock).releaseLock()
-
     def __del__(self):
-        self.releaseLock()
+        self.lock.releaseLock()
+        self._fd_lock.close()
 
 
 class Database(NoDBBase):
@@ -78,6 +91,7 @@ class Database(NoDBBase):
         self._data_dir = data_dir
         self._db = db
         self._fd_lock = open(os.path.join(self._data_dir, self._db, '.lock'), 'w')
+        self.lock = Lock(self._fd_lock)
 
     def getTable(self, table):
         return Table(self._data_dir, self._db, table)
@@ -107,50 +121,29 @@ class Table(NoDBBase):
         self._db = db
         self._table = table
         self._fd_lock = open(os.path.join(self._data_dir, self._db, self._table, '.lock'), 'w')
+        self.lock = Lock(self._fd_lock)
 
-    def get(self, key):
-        """Returns a Row. In a multi-process / multi-threaded application, getReadOnly(key) and
-        getLocked(key) should be used to prevent race conditions."""
-        return Row(self._data_dir, self._db, self._table, key)
+    def getRow(self, key, lock_type=None):
+        row = Row(self._data_dir, self._db, self._table, key, lock_type)
 
-    def getReadOnly(self, key):
-        """Returns a ReadOnlyRow (with no locks). A ReadOnlyRow behaves like a Row except
-        that it is not writable."""
-        return ReadOnlyRow(self._data_dir, self._db, self._table, key)
+    def createRow(self, key, lock=None): # lock can be 'shared' or 'exclusive'
+        with self.lock.ExclusiveLockWrapper():
+            filename = os.path.join(self._data_dir, self._db, self._table, key)
+            if os.path.exists(filename):
+                raise errors.RowAlreadyExists(key)
+            with open(filename, 'w') as fd:
+                fd.write('{}') # touch the file so we can lock it later, and fill it with an empty JSON dict
+            row = Row(self._data_dir, self._db, self._table, key, lock_type)
 
-    def getLocked(self, key):
-        """Returns a LockedRow. The lock is released when the object is deleted, or all references
-        to it are released."""
-        return LockedRow(self._data_dir, self._db, self._table, key)
-
-    def create(self, key):
-        with self.getExclusiveLock():
-            row = Row(self._data_dir, self._db, self._table, key, is_new=True)
         return row
 
-    def createWithUniqueKey(self, key_len=5):
+    def createRowWithUniqueKey(self, key_len=5, lock_type=None):
         while True:
             try:
                 key = self._generateRandomString(key_len)
-                row = self.create(key)
+                row = self.createRow(key, lock_type)
                 break
             except RowAlreadyExists:
-                continue
-
-        return row
-
-    def createLocked(self, key):
-        with self.getExclusiveLock():
-            row = LockedRow(self._data_dir, self._db, self._table, key, is_new=True)
-        return row
-
-    def createLockedWithUniqueKey(self, key_len=5):
-        while True:
-            try:
-                key = self._generateRandomString(key_len)
-                row = self.createLocked(key)
-                break
-            except errors.RowAlreadyExists:
                 continue
 
         return row
@@ -167,39 +160,30 @@ class Table(NoDBBase):
     def _generateRandomString(self, length=5):
         return ''.join([random.choice(string.ascii_letters + string.digits) for i in range(length)])
 
-class RowBase(NoDBBase):
-    def __init__(self, data_dir, db, table, key, is_new=False):
+
+class Row(NoDBBase):
+    def __init__(self, data_dir, db, table, key, lock_type=None):
         self._data_dir = data_dir
         self._db = db
         self._table = table
         self._key = key
         self._filename = os.path.join(self._data_dir, self._db, self._table, key)
+        self._fd_readonly = self._fd_lock = open(self._filename, 'r')
+        self.lock = Lock(self._fd_readonly)
 
-        if is_new: # note: must be run inside a table lock
-            if os.path.exists(self._filename):
-                raise errors.RowAlreadyExists(key)
-            with open(self._filename, 'w') as fd:
-                fd.write('{}') # touch the file so we can lock it later, and fill it with an empty JSON dict
+        if lock_type == 'shared':
+            self.lock.acquireSharedLock()
+        elif lock_type == 'exclusive':
+            self.lock.acquireExclusiveLock()
 
-        try:
-            self._fd_readonly = self._fd_lock = open(self._filename, 'r')
-        except IOError as e:
-            if e.errno == errno.ENOENT: # if the file doesn't exist
-                raise errors.RowDoesNotExist(key)
-            else:
-                raise
-
-        if self._is_locked:
-            self.getExclusiveLock().acquireLock()
-
-        if not is_new:
-            self._loadContents()
+        self._loadContents()
 
     def _loadContents(self):
         self._fd_readonly.seek(0)
-        if not self._is_locked:
-            with self.getSharedLock():
-                contents = self._fd_readonly.read()
+        if self.lock.state = '':
+            self.lock.acquireSharedLock()
+            contents = self._fd_readonly.read()
+            self.lock.releaseLock()
         else:
             contents = self._fd_readonly.read()
         contents = self._desearialize(contents)
@@ -242,13 +226,24 @@ class RowBase(NoDBBase):
     def getKey(self):
         return self._key
 
-
-class WritableRowBase(RowBase):
     def save(self):
+        if self.lock.state == '':
+            self.lock.acquireExclusiveLock()
+            self._writeContents()
+            self.lock.releaseLock()
+        elif self.lock.state == 'shared':
+            self.lock.acquireExclusiveLock()
+            self._writeContents()
+            self.acquireSharedLock()
+        elif self.lock.state == 'exclusive':
+            self._writeContents()
+        else:
+            raise RuntimeError('Invalid lock type.')
+
+    def _writeContents(self)
         attribs = self._serialize()
-        with self.getExclusiveLock():
-            with open(self._filename, 'w') as fd:
-                fd.write(attribs)
+        with open(self._filename, 'w') as fd:
+            fd.write(attribs)
 
     def _serializeHelper(self, d):
         if type(d) in (list, tuple):
@@ -273,21 +268,3 @@ class WritableRowBase(RowBase):
         attribs = self._serializeHelper(attribs)
         attribs = json.dumps(attribs)
         return attribs
-
-
-class Row(WritableRowBase):
-    def __init__(self, *args, **kwargs): 
-        self._is_locked = False
-        super(Row, self).__init__(*args, **kwargs)
- 
-
-class ReadOnlyRow(RowBase):
-    def __init__(self, *args, **kwargs): 
-        self._is_locked = False
-        super(ReadOnlyRow, self).__init__(*args, **kwargs)
-
-
-class LockedRow(WritableRowBase):
-    def __init__(self, *args, **kwargs): 
-        self._is_locked = True
-        super(LockedRow, self).__init__(*args, **kwargs)
