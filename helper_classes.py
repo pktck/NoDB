@@ -36,20 +36,20 @@ json = getFastestJSONModule()
 
 class Lock(object):
     def __init__(self, fd):
-        self.fd = fd
+        self._fd = fd
         self.state = '' # can be 'shared', 'exclusive', 'saving', or '' (no lock)
 
     def acquireSharedLock(self):
-        fcntl.flock(self.fd, fcntl.LOCK_SH)
+        fcntl.flock(self._fd, fcntl.LOCK_SH)
         self.state = 'shared'
 
     def acquireExclusiveLock(self):
-        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
         self.state = 'exclusive'
 
     def releaseLock(self):
         self.state = ''
-        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        fcntl.flock(self._fd, fcntl.LOCK_UN)
 
     def getExclusiveLockWrapper(self):
         return ExclusiveLockWrapper(self)
@@ -60,38 +60,55 @@ class Lock(object):
 
 class ExclusiveLockWrapper(object):
     def __init__(self, lock):
-        self.lock = lock
+        self._lock = lock
 
     def __enter__(self):
-        self.lock.acquireExclusiveLock()
+        self._lock.acquireExclusiveLock()
 
     def __exit__(self, type, value, traceback):
-        self.lock.releaseLock()
+        self._lock.releaseLock()
 
 
 class SharedLockWrapper(object):
     def __init__(self, lock):
-        self.lock = lock
+        self._lock = lock
 
     def __enter__(self):
-        self.lock.acquireSharedLock()
+        self._lock.acquireSharedLock()
 
     def __exit__(self, type, value, traceback):
-        self.lock.releaseLock()
+        self._lock.releaseLock()
 
 
 class NoDBBase(object):
+    def __init__(self, fd_lock):
+        self._fd_lock = fd_lock
+        self._lock = Lock(self._fd_lock)
+
     def __del__(self):
-        self.lock.releaseLock()
+        self.releaseLock()
         self._fd_lock.close()
+
+    def acquireSharedLock(self):
+        self._lock.acquireSharedLock()
+
+    def acquireExclusiveLock(self):
+        self._lock.acquireExclusiveLock()
+
+    def releaseLock(self):
+        self._lock.releaseLock()
+
+    def getLockState(self):
+        return self._lock.state
 
 
 class Database(NoDBBase):
     def __init__(self, data_dir, db):
         self._data_dir = data_dir
         self._db = db
-        self._fd_lock = open(os.path.join(self._data_dir, self._db, '.lock'), 'w')
-        self.lock = Lock(self._fd_lock)
+
+        fd_lock = open(os.path.join(self._data_dir, self._db, '.lock'), 'w')
+        super(Database, self).__init__(fd_lock)
 
     def getTable(self, table):
         return Table(self._data_dir, self._db, table)
@@ -120,14 +137,16 @@ class Table(NoDBBase):
         self._data_dir = data_dir
         self._db = db
         self._table = table
-        self._fd_lock = open(os.path.join(self._data_dir, self._db, self._table, '.lock'), 'w')
-        self.lock = Lock(self._fd_lock)
+
+        fd_lock = open(os.path.join(self._data_dir, self._db, self._table, '.lock'), 'w')
+        super(Table, self).__init__(fd_lock)
 
     def getRow(self, key, lock_type=None):
         row = Row(self._data_dir, self._db, self._table, key, lock_type)
+        return row
 
-    def createRow(self, key, lock=None): # lock can be 'shared' or 'exclusive'
-        with self.lock.ExclusiveLockWrapper():
+    def createRow(self, key, lock_type=None): # lock can be 'shared' or 'exclusive'
+        with self._lock.getExclusiveLockWrapper():
             filename = os.path.join(self._data_dir, self._db, self._table, key)
             if os.path.exists(filename):
                 raise errors.RowAlreadyExists(key)
@@ -143,7 +162,7 @@ class Table(NoDBBase):
                 key = self._generateRandomString(key_len)
                 row = self.createRow(key, lock_type)
                 break
-            except RowAlreadyExists:
+            except errors.RowAlreadyExists:
                 continue
 
         return row
@@ -168,22 +187,22 @@ class Row(NoDBBase):
         self._table = table
         self._key = key
         self._filename = os.path.join(self._data_dir, self._db, self._table, key)
-        self._fd_readonly = self._fd_lock = open(self._filename, 'r')
-        self.lock = Lock(self._fd_readonly)
+        self._fd_readonly = open(self._filename, 'r')
+        super(Row, self).__init__(self._fd_readonly)
 
         if lock_type == 'shared':
-            self.lock.acquireSharedLock()
+            self.acquireSharedLock()
         elif lock_type == 'exclusive':
-            self.lock.acquireExclusiveLock()
+            self.acquireExclusiveLock()
 
         self._loadContents()
 
     def _loadContents(self):
         self._fd_readonly.seek(0)
-        if self.lock.state = '':
-            self.lock.acquireSharedLock()
+        if self.getLockState() == '':
+            self.acquireSharedLock()
             contents = self._fd_readonly.read()
-            self.lock.releaseLock()
+            self.releaseLock()
         else:
             contents = self._fd_readonly.read()
         contents = self._desearialize(contents)
@@ -227,20 +246,20 @@ class Row(NoDBBase):
         return self._key
 
     def save(self):
-        if self.lock.state == '':
-            self.lock.acquireExclusiveLock()
+        if self.getLockState() == '':
+            self.acquireExclusiveLock()
             self._writeContents()
-            self.lock.releaseLock()
-        elif self.lock.state == 'shared':
-            self.lock.acquireExclusiveLock()
+            self.releaseLock()
+        elif self.getLockState() == 'shared':
+            self.acquireExclusiveLock()
             self._writeContents()
             self.acquireSharedLock()
-        elif self.lock.state == 'exclusive':
+        elif self.getLockState() == 'exclusive':
             self._writeContents()
         else:
             raise RuntimeError('Invalid lock type.')
 
-    def _writeContents(self)
+    def _writeContents(self):
         attribs = self._serialize()
         with open(self._filename, 'w') as fd:
             fd.write(attribs)
